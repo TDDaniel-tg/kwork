@@ -349,6 +349,31 @@ def run_health_server():
     server.serve_forever()
 
 # ─────────────────────────────────────────────
+#  Self-ping Keep-Alive для Render (Free Tier)
+# ─────────────────────────────────────────────
+
+async def self_ping_loop():
+    ping_url = os.getenv("PING_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if not ping_url:
+        log.info("No PING_URL or RENDER_EXTERNAL_URL environment variable found. Self-ping loop disabled.")
+        return
+
+    # Нормализуем URL: добавляем /ping в конец, если его нет
+    if not ping_url.endswith("/ping"):
+        ping_url = ping_url.rstrip("/") + "/ping"
+
+    log.info(f"🚀 Запущен цикл self-ping. Цель: {ping_url}")
+    import aiohttp
+    while True:
+        await asyncio.sleep(600)  # Пингуем каждые 10 минут (600 секунд)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ping_url, timeout=10) as response:
+                    log.info(f"Результат self-ping: {response.status}")
+        except Exception as e:
+            log.warning(f"Ошибка self-ping: {e}")
+
+# ─────────────────────────────────────────────
 #  Точка входа
 # ─────────────────────────────────────────────
 
@@ -364,6 +389,7 @@ async def main():
         await asyncio.gather(
             monitor_loop(app.bot),
             app.updater.start_polling(),
+            self_ping_loop(),  # Запускаем пинг-петлю параллельно с ботом
         )
         await app.stop()
 

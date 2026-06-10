@@ -11,3 +11,8 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: PING_URL
+        fromService:
+          name: freelance-scanner-bot
+          type: web
+          property: url
