@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: freelance-scanner-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python freelance_scanner_bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
