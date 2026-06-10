@@ -124,7 +124,7 @@ genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel("gemini-2.0-flash")
 
 
-def ai_evaluate(title: str, description: str) -> tuple[int, str]:
+async def ai_evaluate(title: str, description: str) -> tuple[int, str]:
     """Оценивает заказ по соответствию навыкам. Возвращает (оценка 1-10, причина)."""
     prompt = f"""Ты помощник фрилансера. Оцени, насколько заказ подходит исполнителю.
 
@@ -138,17 +138,25 @@ def ai_evaluate(title: str, description: str) -> tuple[int, str]:
 Ответь СТРОГО в формате JSON без лишнего текста и без markdown-обёрток:
 {{"score": <число от 1 до 10>, "reason": "<1 предложение почему>"}}
 """
-    try:
-        response = model.generate_content(prompt)
-        raw = response.text.strip().replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
-        return int(data["score"]), data["reason"]
-    except Exception as e:
-        log.warning(f"Ошибка оценки AI: {e}")
-        return 0, "Ошибка оценки"
+    for attempt in range(4):
+        try:
+            response = await model.generate_content_async(prompt)
+            raw = response.text.strip().replace("```json", "").replace("```", "").strip()
+            data = json.loads(raw)
+            return int(data["score"]), data["reason"]
+        except Exception as e:
+            err_msg = str(e)
+            if "429" in err_msg or "quota" in err_msg.lower() or "limit" in err_msg.lower():
+                wait_time = 15 * (attempt + 1)
+                log.warning(f"Превышена квота Gemini API (429), повтор через {wait_time} сек... (Попытка {attempt+1}/4)")
+                await asyncio.sleep(wait_time)
+                continue
+            log.warning(f"Ошибка оценки AI: {e}")
+            return 0, "Ошибка оценки"
+    return 0, "Ошибка: превышена квота запросов"
 
 
-def ai_generate_response(title: str, description: str) -> str:
+async def ai_generate_response(title: str, description: str) -> str:
     """Генерирует персонализированный текст отклика на заказ."""
     prompt = f"""Ты фрилансер Даниэль Ташматов — Full-Stack и AI разработчик, 17 лет, 3+ года опыта.
 Стек: React, Next.js, Django, FastAPI, Python, GPT-4, LangChain, Computer Vision, React Native.
@@ -170,12 +178,20 @@ def ai_generate_response(title: str, description: str) -> str:
 
 Отвечай ТОЛЬКО текстом отклика, без пояснений и заголовков.
 """
-    try:
-        response = model.generate_content(prompt)
-        return response.text.strip()
-    except Exception as e:
-        log.warning(f"Ошибка генерации отклика: {e}")
-        return "Не удалось сгенерировать отклик. Попробуй ещё раз."
+    for attempt in range(3):
+        try:
+            response = await model.generate_content_async(prompt)
+            return response.text.strip()
+        except Exception as e:
+            err_msg = str(e)
+            if "429" in err_msg or "quota" in err_msg.lower() or "limit" in err_msg.lower():
+                wait_time = 10 * (attempt + 1)
+                log.warning(f"Превышена квота Gemini API при генерации отклика, повтор через {wait_time} сек... (Попытка {attempt+1}/3)")
+                await asyncio.sleep(wait_time)
+                continue
+            log.warning(f"Ошибка генерации отклика: {e}")
+            return "Не удалось сгенерировать отклик. Попробуй ещё раз."
+    return "Не удалось сгенерировать отклик из-за ограничений квоты."
 
 
 # ─────────────────────────────────────────────
@@ -238,7 +254,7 @@ async def on_generate_response(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     loading_msg = await query.message.reply_text("⏳ Генерирую отклик через Gemini…")
-    response_text = ai_generate_response(order["title"], order["description"])
+    response_text = await ai_generate_response(order["title"], order["description"])
 
     await loading_msg.edit_text(
         f"✍️ *Текст отклика:*\n\n{response_text}\n\n"
@@ -314,7 +330,7 @@ async def monitor_loop(bot: Bot):
         log.info("Новых заказов: %d", len(new_orders))
 
         for order in new_orders:
-            score, reason = ai_evaluate(order["title"], order["description"])
+            score, reason = await ai_evaluate(order["title"], order["description"])
             log.info("[%d/10] %s", score, order["title"])
 
             if score >= MIN_SCORE:
@@ -323,6 +339,10 @@ async def monitor_loop(bot: Bot):
                     await asyncio.sleep(1)  # небольшая пауза между сообщениями
                 except Exception as e:
                     log.warning("⚠️ Не удалось отправить уведомление о заказе %s: %s", order["id"], e)
+            
+            # Добавляем 4-секундную задержку между вызовами Gemini API,
+            # чтобы гарантированно не превысить лимит 15 запросов в минуту (RPM).
+            await asyncio.sleep(4)
 
 
 # ─────────────────────────────────────────────
