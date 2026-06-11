@@ -1,30 +1,28 @@
 """
-Фриланс-сканер бот (Gemini Edition)
-=====================================
-Мониторит fl.ru в реальном времени.
+Kwork Фриланс-сканер бот
+=========================
+Мониторит биржу заказов Kwork в реальном времени.
 Как только появляется подходящий заказ — сразу присылает в Telegram.
 Можно сгенерировать отклик одной кнопкой.
 
 Установка зависимостей:
-    pip install python-telegram-bot feedparser google-generativeai aiohttp
-
-Получить бесплатный Gemini API ключ:
-    https://aistudio.google.com/apikey
+    pip install python-telegram-bot google-generativeai aiohttp
 
 Настройка:
-    Отредактируй блок CONFIG ниже.
+    Заполни .env файл (TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GEMINI_API_KEY)
 
 Запуск:
     python freelance_scanner_bot.py
 """
 
 import asyncio
-import feedparser
+import aiohttp
 import google.generativeai as genai
 import logging
 import json
-import hashlib
+import re
 import os
+import time
 
 # Load local .env file if it exists (for local development)
 if os.path.exists(".env"):
@@ -42,15 +40,15 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 # ─────────────────────────────────────────────
-#  CONFIG — заполни эти три строки или используй ENV
+#  CONFIG
 # ─────────────────────────────────────────────
 
-TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")  # от @BotFather
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")             # узнать: @userinfobot
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")       # aistudio.google.com/apikey (бесплатно)
+TELEGRAM_TOKEN    = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID", "")
+GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY", "")
 
 # ─────────────────────────────────────────────
-#  Твои данные (уже заполнено по твоему сайту)
+#  Твои данные
 # ─────────────────────────────────────────────
 
 MY_SKILLS = """
@@ -84,20 +82,28 @@ MY_PORTFOLIO_HIGHLIGHTS = """
 """
 
 # Минимальный порог оценки (1-10), при котором бот присылает заказ
-MIN_SCORE = 6
+MIN_SCORE = 4
 
-# Интервал проверки RSS в секундах
-CHECK_INTERVAL = 60
+# Интервал проверки в секундах
+CHECK_INTERVAL = 90
 
 # ─────────────────────────────────────────────
-#  RSS-ленты бирж
+#  Kwork: категории для мониторинга
 # ─────────────────────────────────────────────
 
-RSS_FEEDS = [
-    {"name": "fl.ru",      "url": "https://www.fl.ru/rss/all.xml"},
-    {"name": "fl.ru (IT)", "url": "https://www.fl.ru/rss/it.xml"},
-    # Добавляй другие биржи сюда при наличии RSS
+# Парсим несколько страниц для полного покрытия
+KWORK_URLS = [
+    # Все категории программирования
+    "https://kwork.ru/projects?c=11",
+    # Все категории (на случай если заказ в другой рубрике, но подходит по навыкам)
+    "https://kwork.ru/projects?c=all",
 ]
+
+KWORK_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
 
 # ─────────────────────────────────────────────
 #  Внутреннее состояние
@@ -105,6 +111,15 @@ RSS_FEEDS = [
 
 seen_ids: set = set()
 pending_orders: dict = {}
+
+# Счётчики для статистики
+stats = {
+    "total_checked": 0,
+    "total_sent": 0,
+    "total_skipped": 0,
+    "last_check": None,
+    "errors": 0,
+}
 
 # ─────────────────────────────────────────────
 #  Логирование
@@ -133,7 +148,11 @@ async def ai_evaluate(title: str, description: str) -> tuple[int, str]:
 
 Заказ:
 Название: {title}
-Описание: {description[:800]}
+Описание: {description[:1000]}
+
+ВАЖНО: Оценивай щедро. Если заказ хоть как-то связан с программированием, ботами, 
+веб-разработкой, AI, парсингом, автоматизацией — ставь 5+.
+Если прямо по стеку — 7+.
 
 Ответь СТРОГО в формате JSON без лишнего текста и без markdown-обёрток:
 {{"score": <число от 1 до 10>, "reason": "<1 предложение почему>"}}
@@ -148,7 +167,7 @@ async def ai_evaluate(title: str, description: str) -> tuple[int, str]:
             err_msg = str(e)
             if "429" in err_msg or "quota" in err_msg.lower() or "limit" in err_msg.lower():
                 wait_time = 15 * (attempt + 1)
-                log.warning(f"Превышена квота Gemini API (429), повтор через {wait_time} сек... (Попытка {attempt+1}/4)")
+                log.warning(f"Квота Gemini API (429), повтор через {wait_time} сек... (Попытка {attempt+1}/4)")
                 await asyncio.sleep(wait_time)
                 continue
             log.warning(f"Ошибка оценки AI: {e}")
@@ -186,7 +205,7 @@ async def ai_generate_response(title: str, description: str) -> str:
             err_msg = str(e)
             if "429" in err_msg or "quota" in err_msg.lower() or "limit" in err_msg.lower():
                 wait_time = 10 * (attempt + 1)
-                log.warning(f"Превышена квота Gemini API при генерации отклика, повтор через {wait_time} сек... (Попытка {attempt+1}/3)")
+                log.warning(f"Квота Gemini при генерации отклика, повтор через {wait_time} сек...")
                 await asyncio.sleep(wait_time)
                 continue
             log.warning(f"Ошибка генерации отклика: {e}")
@@ -195,29 +214,127 @@ async def ai_generate_response(title: str, description: str) -> str:
 
 
 # ─────────────────────────────────────────────
+#  Kwork: парсинг заказов
+# ─────────────────────────────────────────────
+
+async def fetch_kwork_orders(session: aiohttp.ClientSession) -> list[dict]:
+    """Парсит заказы с биржи Kwork через HTML (window.stateData)."""
+    all_orders = []
+    seen_in_batch = set()  # Чтобы не дублировать между категориями
+
+    for url in KWORK_URLS:
+        try:
+            # Парсим первые 2 страницы каждой категории
+            for page in range(1, 3):
+                page_url = f"{url}&page={page}" if page > 1 else url
+
+                async with session.get(page_url, headers=KWORK_HEADERS, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    if resp.status != 200:
+                        log.warning(f"Kwork вернул статус {resp.status} для {page_url}")
+                        continue
+
+                    html = await resp.text()
+
+                # Извлекаем JSON из window.stateData
+                match = re.search(r'window\.stateData\s*=\s*(\{.*)', html, re.DOTALL)
+                if not match:
+                    log.warning(f"Не найден stateData на {page_url}")
+                    continue
+
+                try:
+                    decoder = json.JSONDecoder()
+                    data, _ = decoder.raw_decode(match.group(1))
+                except json.JSONDecodeError as e:
+                    log.warning(f"Ошибка парсинга JSON stateData: {e}")
+                    continue
+
+                wants = data.get("wants", [])
+                if not wants:
+                    log.debug(f"Нет заказов на {page_url}")
+                    break  # Нет больше страниц
+
+                for want in wants:
+                    want_id = str(want.get("id", ""))
+                    if not want_id or want_id in seen_in_batch:
+                        continue
+                    seen_in_batch.add(want_id)
+
+                    # Чистим HTML из описания
+                    description = want.get("description", "")
+                    description = re.sub(r'<[^>]+>', ' ', description)
+                    description = re.sub(r'\s+', ' ', description).strip()
+
+                    name = want.get("name", "Без названия")
+                    # Декодируем HTML-сущности
+                    name = name.replace("&rarr;", "→").replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+
+                    price = want.get("priceLimit", "")
+                    price_str = f"{price} руб." if price else "Не указана"
+
+                    # Формируем ссылку
+                    link = f"https://kwork.ru/projects/{want_id}/view"
+
+                    # Время
+                    dates = want.get("wantDates", {})
+                    date_active = dates.get("dateActive", want.get("date_active", ""))
+
+                    all_orders.append({
+                        "id": f"kwork_{want_id}",
+                        "source": "Kwork",
+                        "title": name,
+                        "description": description,
+                        "link": link,
+                        "published": date_active,
+                        "price": price_str,
+                        "category_id": want.get("category_id", ""),
+                        "time_left": want.get("timeLeft", ""),
+                    })
+
+                log.info(f"Kwork {page_url}: получено {len(wants)} заказов")
+
+                # Пауза между страницами чтобы не банили
+                await asyncio.sleep(2)
+
+        except asyncio.TimeoutError:
+            log.warning(f"Таймаут при загрузке {url}")
+            stats["errors"] += 1
+        except Exception as e:
+            log.warning(f"Ошибка при парсинге Kwork ({url}): {e}")
+            stats["errors"] += 1
+
+    return all_orders
+
+
+# ─────────────────────────────────────────────
 #  Telegram: отправка карточки заказа
 # ─────────────────────────────────────────────
 
 async def send_order_notification(bot: Bot, order: dict, score: int, reason: str):
-    source = order["source"]
     title  = order["title"]
     link   = order["link"]
     desc   = order["description"][:300] + ("…" if len(order["description"]) > 300 else "")
     pub    = order.get("published", "")
+    price  = order.get("price", "")
+    time_left = order.get("time_left", "")
 
-    score_emoji = "🔥" if score >= 8 else "✅" if score >= 6 else "⚠️"
+    score_emoji = "🔥" if score >= 8 else "✅" if score >= 6 else "📋" if score >= 4 else "⚠️"
 
-    # Экранируем спецсимволы Markdown в title и reason
-    def esc(s): return s.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`")
+    # Экранируем спецсимволы Markdown
+    def esc(s): return s.replace("*", "\\*").replace("_", "\\_").replace("`", "\\`").replace("[", "\\[")
 
     text = (
-        f"{score_emoji} *Новый заказ — {source}*\n\n"
+        f"{score_emoji} *Новый заказ — Kwork*\n\n"
         f"*{esc(title)}*\n\n"
         f"{esc(desc)}\n\n"
+        f"💰 Бюджет: *{esc(price)}*\n"
         f"📊 Оценка: *{score}/10* — _{esc(reason)}_\n"
-        f"🕐 {pub}\n\n"
-        f"🔗 [Открыть заказ]({link})"
+        f"🕐 {esc(pub)}"
     )
+
+    if time_left:
+        text += f" (осталось {esc(time_left)})"
+
+    text += f"\n\n🔗 [Открыть заказ]({link})"
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✍️ Сгенерировать отклик", callback_data=f"gen_{order['id']}")
@@ -265,88 +382,129 @@ async def on_generate_response(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ─────────────────────────────────────────────
-#  Парсинг RSS
-# ─────────────────────────────────────────────
-
-def fetch_new_orders() -> list[dict]:
-    new_orders = []
-    for feed_cfg in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(feed_cfg["url"])
-            for entry in feed.entries:
-                uid = hashlib.md5(
-                    entry.get("link", entry.get("id", entry.get("title", ""))).encode()
-                ).hexdigest()
-
-                if uid in seen_ids:
-                    continue
-                seen_ids.add(uid)
-
-                new_orders.append({
-                    "id":          uid,
-                    "source":      feed_cfg["name"],
-                    "title":       entry.get("title", "Без названия"),
-                    "description": entry.get("summary", entry.get("description", "")),
-                    "link":        entry.get("link", ""),
-                    "published":   entry.get("published", ""),
-                })
-        except Exception as e:
-            log.warning(f"Ошибка чтения {feed_cfg['name']}: {e}")
-    return new_orders
-
-
-# ─────────────────────────────────────────────
 #  Главный цикл мониторинга
 # ─────────────────────────────────────────────
 
 async def monitor_loop(bot: Bot):
-    log.info("🚀 Сканер запущен. Интервал: %d сек.", CHECK_INTERVAL)
+    log.info("🚀 Сканер Kwork запущен. Интервал: %d сек.", CHECK_INTERVAL)
 
-    # Первый прогон — только заполняем seen_ids, не отправляем старые заказы
-    log.info("Инициализация: загружаю текущие заказы…")
-    fetch_new_orders()
-    log.info("Готово. Слежу за новыми заказами…")
+    async with aiohttp.ClientSession() as session:
+        # Первый прогон — заполняем seen_ids, не отправляем старые
+        log.info("Инициализация: загружаю текущие заказы с Kwork…")
+        try:
+            init_orders = await fetch_kwork_orders(session)
+            for order in init_orders:
+                seen_ids.add(order["id"])
+            log.info(f"Загружено {len(init_orders)} существующих заказов в кэш (не отправляем)")
+        except Exception as e:
+            log.error(f"Ошибка при инициализации: {e}")
 
-    try:
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=(
-                "✅ *Сканер запущен!*\n"
-                "Буду присылать подходящие заказы сразу как только они появятся.\n"
-                f"Порог оценки: {MIN_SCORE}/10 • Модель: Gemini 2.0 Flash"
-            ),
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        log.warning("⚠️ Не удалось отправить приветственное сообщение: %s. Пожалуйста, напишите /start вашему боту в Telegram.", e)
+        # Отправляем приветственное сообщение
+        try:
+            await bot.send_message(
+                chat_id=TELEGRAM_CHAT_ID,
+                text=(
+                    "✅ *Kwork-сканер запущен\\!*\n\n"
+                    f"📌 Отслеживаю биржу заказов Kwork\n"
+                    f"🎯 Порог оценки: {MIN_SCORE}/10\n"
+                    f"⏱ Интервал проверки: {CHECK_INTERVAL} сек\n"
+                    f"🤖 Модель: Gemini 2\\.0 Flash\n"
+                    f"📦 Заказов в кэше: {len(seen_ids)}\n\n"
+                    f"Буду присылать подходящие заказы сразу как появятся\\."
+                ),
+                parse_mode="MarkdownV2"
+            )
+        except Exception as e:
+            log.warning(f"⚠️ Не удалось отправить приветствие: {e}")
+            # Пробуем без форматирования
+            try:
+                await bot.send_message(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    text=(
+                        f"✅ Kwork-сканер запущен!\n\n"
+                        f"📌 Отслеживаю биржу заказов Kwork\n"
+                        f"🎯 Порог оценки: {MIN_SCORE}/10\n"
+                        f"⏱ Интервал проверки: {CHECK_INTERVAL} сек\n"
+                        f"📦 Заказов в кэше: {len(seen_ids)}\n\n"
+                        f"Буду присылать подходящие заказы сразу как появятся."
+                    ),
+                )
+            except Exception as e2:
+                log.error(f"Не удалось отправить приветствие даже без форматирования: {e2}")
 
-    while True:
-        await asyncio.sleep(CHECK_INTERVAL)
+        check_count = 0
 
-        new_orders = fetch_new_orders()
-        if not new_orders:
-            continue
+        while True:
+            await asyncio.sleep(CHECK_INTERVAL)
+            check_count += 1
 
-        log.info("Новых заказов: %d", len(new_orders))
+            log.info(f"── Проверка #{check_count} ──")
 
-        for order in new_orders:
-            score, reason = await ai_evaluate(order["title"], order["description"])
-            log.info("[%d/10] %s", score, order["title"])
+            try:
+                all_orders = await fetch_kwork_orders(session)
+            except Exception as e:
+                log.error(f"Ошибка получения заказов: {e}")
+                stats["errors"] += 1
+                continue
 
-            if score >= MIN_SCORE:
-                try:
-                    await send_order_notification(bot, order, score, reason)
-                    await asyncio.sleep(1)  # небольшая пауза между сообщениями
-                except Exception as e:
-                    log.warning("⚠️ Не удалось отправить уведомление о заказе %s: %s", order["id"], e)
-            
-            # Добавляем 4-секундную задержку между вызовами Gemini API,
-            # чтобы гарантированно не превысить лимит 15 запросов в минуту (RPM).
-            await asyncio.sleep(4)
+            # Фильтруем только новые
+            new_orders = [o for o in all_orders if o["id"] not in seen_ids]
+
+            # Добавляем в seen_ids
+            for order in all_orders:
+                seen_ids.add(order["id"])
+
+            stats["last_check"] = time.strftime("%H:%M:%S")
+
+            if not new_orders:
+                log.info(f"Новых заказов нет (всего в кэше: {len(seen_ids)})")
+                # Каждые 20 проверок отправляем статус
+                if check_count % 20 == 0:
+                    try:
+                        await bot.send_message(
+                            chat_id=TELEGRAM_CHAT_ID,
+                            text=(
+                                f"📊 *Статус сканера*\n\n"
+                                f"Проверок: {check_count}\n"
+                                f"Отправлено: {stats['total_sent']}\n"
+                                f"Проверено: {stats['total_checked']}\n"
+                                f"Пропущено: {stats['total_skipped']}\n"
+                                f"Ошибок: {stats['errors']}\n"
+                                f"В кэше: {len(seen_ids)} заказов"
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+                continue
+
+            log.info(f"🆕 Новых заказов: {len(new_orders)}")
+
+            for order in new_orders:
+                stats["total_checked"] += 1
+
+                score, reason = await ai_evaluate(order["title"], order["description"])
+                log.info(f"  [{score}/10] {order['title'][:60]} — {reason}")
+
+                if score >= MIN_SCORE:
+                    try:
+                        await send_order_notification(bot, order, score, reason)
+                        stats["total_sent"] += 1
+                        log.info(f"  ✅ Отправлено в Telegram")
+                        await asyncio.sleep(1)
+                    except Exception as e:
+                        log.warning(f"  ⚠️ Ошибка отправки: {e}")
+                        stats["errors"] += 1
+                else:
+                    stats["total_skipped"] += 1
+                    log.info(f"  ⏭️ Пропущено (оценка {score} < {MIN_SCORE})")
+
+                # Пауза между вызовами Gemini API
+                await asyncio.sleep(4)
 
 
 # ─────────────────────────────────────────────
-#  Веб-сервер для Health Check на Render (Free Tier)
+#  Веб-сервер для Health Check на Render
 # ─────────────────────────────────────────────
 
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -355,11 +513,19 @@ import threading
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b"OK")
+        status = json.dumps({
+            "status": "ok",
+            "checked": stats["total_checked"],
+            "sent": stats["total_sent"],
+            "skipped": stats["total_skipped"],
+            "errors": stats["errors"],
+            "cached": len(seen_ids),
+            "last_check": stats["last_check"],
+        })
+        self.wfile.write(status.encode())
     def log_message(self, format, *args):
-        # Отключаем логирование запросов, чтобы не забивать логи
         return
 
 def run_health_server():
@@ -369,36 +535,50 @@ def run_health_server():
     server.serve_forever()
 
 # ─────────────────────────────────────────────
-#  Self-ping Keep-Alive для Render (Free Tier)
+#  Self-ping Keep-Alive для Render
 # ─────────────────────────────────────────────
 
 async def self_ping_loop():
     ping_url = os.getenv("PING_URL") or os.getenv("RENDER_EXTERNAL_URL")
     if not ping_url:
-        log.info("No PING_URL or RENDER_EXTERNAL_URL environment variable found. Self-ping loop disabled.")
+        log.info("No PING_URL or RENDER_EXTERNAL_URL. Self-ping disabled.")
         return
 
-    # Нормализуем URL: добавляем /ping в конец, если его нет
-    if not ping_url.endswith("/ping"):
-        ping_url = ping_url.rstrip("/") + "/ping"
+    if not ping_url.startswith("http"):
+        ping_url = "https://" + ping_url
 
-    log.info(f"🚀 Запущен цикл self-ping. Цель: {ping_url}")
-    import aiohttp
+    log.info(f"🏓 Self-ping запущен: {ping_url}")
+
     while True:
-        await asyncio.sleep(600)  # Пингуем каждые 10 минут (600 секунд)
+        await asyncio.sleep(600)
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(ping_url, timeout=10) as response:
-                    log.info(f"Результат self-ping: {response.status}")
+                async with session.get(ping_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                    log.info(f"Self-ping: {response.status}")
         except Exception as e:
-            log.warning(f"Ошибка self-ping: {e}")
+            log.warning(f"Self-ping ошибка: {e}")
+
 
 # ─────────────────────────────────────────────
 #  Точка входа
 # ─────────────────────────────────────────────
 
 async def main():
-    # Запускаем Health Check веб-сервер в фоновом потоке
+    log.info("=" * 50)
+    log.info("  Kwork Freelance Scanner Bot")
+    log.info("=" * 50)
+
+    if not TELEGRAM_TOKEN:
+        log.error("❌ TELEGRAM_TOKEN не задан!")
+        return
+    if not TELEGRAM_CHAT_ID:
+        log.error("❌ TELEGRAM_CHAT_ID не задан!")
+        return
+    if not GEMINI_API_KEY:
+        log.error("❌ GEMINI_API_KEY не задан!")
+        return
+
+    # Health Check сервер
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -409,7 +589,7 @@ async def main():
         await asyncio.gather(
             monitor_loop(app.bot),
             app.updater.start_polling(),
-            self_ping_loop(),  # Запускаем пинг-петлю параллельно с ботом
+            self_ping_loop(),
         )
         await app.stop()
 
